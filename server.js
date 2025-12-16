@@ -135,7 +135,7 @@ app.post("/vf/reply", async (req, res) => {
       headers: {
         "Content-Type": "application/json",
         // Dacă tu folosești alt format (ex: API key simplu), spune-mi.
-        Authorization: `Bearer ${VF_API_KEY}`,
+        Authorization: `${VF_API_KEY}`,
       },
       body: JSON.stringify(vfBody),
     });
