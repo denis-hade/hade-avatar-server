@@ -2,8 +2,10 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
+import multer from "multer";
 
 const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
 
 // =======================
 // ENV
@@ -14,9 +16,8 @@ const PORT = Number(process.env.PORT || 8080);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://hadeai.agency";
 
 // Voiceflow
-// Ex: 68f923843ccaaf1cb3d6b478 (ce ai în URL la /state/<ID>/user/...)
 const VF_STATE_ID = process.env.VF_STATE_ID || "";
-const VF_API_KEY = process.env.VF_API_KEY || ""; // Bearer token / API key (cum folosești tu acum)
+const VF_API_KEY = process.env.VF_API_KEY || "";
 const VF_RUNTIME_BASE = process.env.VF_RUNTIME_BASE || "https://general-runtime.voiceflow.com";
 
 // D-ID
@@ -24,11 +25,14 @@ const DID_BASIC_USER = process.env.DID_BASIC_USER || "";
 const DID_BASIC_PASS = process.env.DID_BASIC_PASS || "";
 const DID_ALLOWED_DOMAIN = process.env.DID_ALLOWED_DOMAIN || "https://hadeai.agency";
 
+// Deepgram
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
+
 // =======================
 // Middleware
 // =======================
 app.use(helmet());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(morgan("combined"));
 
 app.use(
@@ -42,9 +46,7 @@ app.use(
 // =======================
 // Health + Root
 // =======================
-app.get("/", (_req, res) => {
-  res.status(200).send("OK");
-});
+app.get("/", (_req, res) => res.status(200).send("OK"));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "hade-avatar-server" });
@@ -66,22 +68,16 @@ function didBasicAuthHeader() {
 }
 
 function extractVoiceflowReply(traces) {
-  // Voiceflow returnează de obicei un array de "traces"
-  // noi colectăm toate mesajele text și le concatenăm
   if (!Array.isArray(traces)) return "";
-
   const parts = [];
-
   for (const t of traces) {
     if (!t || t.type !== "text") continue;
 
-    // 1) payload.message (cel mai comun)
     if (typeof t?.payload?.message === "string" && t.payload.message.trim()) {
       parts.push(t.payload.message.trim());
       continue;
     }
 
-    // 2) payload.slate.content -> text nodes
     const content = t?.payload?.slate?.content;
     if (Array.isArray(content)) {
       const texts = [];
@@ -96,7 +92,6 @@ function extractVoiceflowReply(traces) {
       if (texts.length) parts.push(texts.join(" "));
     }
   }
-
   return parts.join("\n").trim();
 }
 
@@ -124,17 +119,13 @@ app.post("/vf/reply", async (req, res) => {
     )}/user/${encodeURIComponent(sessionId)}/interact`;
 
     const vfBody = {
-      request: {
-        type: "text",
-        payload: userText.trim(),
-      },
+      request: { type: "text", payload: userText.trim() },
     };
 
     const r = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // Dacă tu folosești alt format (ex: API key simplu), spune-mi.
         Authorization: `${VF_API_KEY}`,
       },
       body: JSON.stringify(vfBody),
@@ -150,14 +141,58 @@ app.post("/vf/reply", async (req, res) => {
       });
     }
 
-    // Voiceflow: data poate fi array direct (traces) sau obiect.
     const traces = Array.isArray(data) ? data : data?.trace || data?.traces || data;
-
-    const replyText = extractVoiceflowReply(traces) || "Îmi pare rău, nu am un răspuns acum.";
+    const replyText =
+      extractVoiceflowReply(traces) || "Îmi pare rău, nu am un răspuns acum.";
 
     return res.json({ replyText });
   } catch (err) {
     return res.status(500).json({ error: "server_error", message: err.message });
+  }
+});
+
+// =================[js] =======================
+// Deepgram STT
+// POST /stt/transcribe (multipart/form-data)
+// field: audio (Blob/File)
+// -> { text }
+// =======================
+app.post("/stt/transcribe", upload.single("audio"), async (req, res) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error("Missing OPENAI_API_KEY");
+    }
+
+    if (!req.file?.buffer) {
+      return res.status(400).json({ error: "Missing audio file" });
+    }
+
+    const formData = new FormData();
+    formData.append(
+      "file",
+      new Blob([req.file.buffer], { type: req.file.mimetype }),
+      "audio.webm"
+    );
+    formData.append("model", "whisper-1");
+    formData.append("language", "ro");
+
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: formData,
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      return res.status(500).json({ error: "whisper_error", details: data });
+    }
+
+    return res.json({ text: data.text || "" });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -170,14 +205,12 @@ let cachedAt = 0;
 
 app.get("/did/client-key", async (_req, res) => {
   try {
-    // Cache 10 minute ca să nu bați API-ul aiurea
     if (cachedClientKey && Date.now() - cachedAt < 10 * 60 * 1000) {
       return res.json({ clientKey: cachedClientKey, cached: true });
     }
 
     const authHeader = didBasicAuthHeader();
 
-    // 1) Încearcă GET
     const getR = await fetch("https://api.d-id.com/agents/client-key", {
       method: "GET",
       headers: {
@@ -196,7 +229,6 @@ app.get("/did/client-key", async (_req, res) => {
       }
     }
 
-    // 2) Dacă nu merge GET, încearcă POST (create)
     const postR = await fetch("https://api.d-id.com/agents/client-key", {
       method: "POST",
       headers: {
@@ -210,7 +242,6 @@ app.get("/did/client-key", async (_req, res) => {
 
     const postData = await postR.json().catch(() => ({}));
 
-    // Dacă există deja, facem încă un GET și returnăm ce avem
     if (!postR.ok && (postData?.description || "").includes("already exists")) {
       const getR2 = await fetch("https://api.d-id.com/agents/client-key", {
         method: "GET",
@@ -258,7 +289,6 @@ app.get("/did/client-key", async (_req, res) => {
   }
 });
 
-// =======================
 app.listen(PORT, () => {
   console.log(`Server running on :${PORT}`);
 });
